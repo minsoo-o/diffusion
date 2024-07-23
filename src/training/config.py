@@ -1,7 +1,6 @@
 class TrainConfig:
     num_epochs: int = 100
-    lr: float = 1e-3
-    max_steps: int = 1000
+    lr: float = 1e-4
     n_attn_head: int = 8
     batch_size: int = 128
     in_channels: int = 1
