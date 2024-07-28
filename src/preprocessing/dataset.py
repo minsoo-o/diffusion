@@ -6,7 +6,7 @@ from kmspy import Dataset, DataLoader
 
 def parse_fn(data):
     label = int(data[0])
-    image = np.array(data[1:], dtype=np.float32)
+    image = np.array(data[1:], dtype=np.float32)/255.
     image = image.reshape(1, 28, 28)
     return {"image": image, "label": label}
 

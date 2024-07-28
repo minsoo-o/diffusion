@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,9 +22,15 @@ class SwitchSequential(nn.Sequential):
     
     
 class UNet(nn.Module):
-    def __init__(self, channels=[32, 64, 128, 256], n_attn_head=8, t_emb_dim=256, y_emb_dim=256) -> None:
+    def __init__(self, marginal_prob_std, channels=[32, 64, 128, 256], n_attn_head=8, t_emb_dim=256, y_emb_dim=256) -> None:
         super().__init__()
+        self.marginal_prob_std = marginal_prob_std
         self.t_emb_dim = t_emb_dim
+        self.t_emb_layer = nn.Sequential(
+            TimeEmbedding(t_emb_dim),
+            nn.Linear(t_emb_dim, t_emb_dim),
+            nn.GELU()
+        )
         self.in_conv = nn.Conv2d(1, channels[0], kernel_size=3, stride=1, padding=1, bias=False)
         self.encoder_layers = nn.ModuleList(
             [
@@ -42,20 +49,21 @@ class UNet(nn.Module):
         self.decoder_layers = nn.ModuleList(
             [
                 SwitchSequential(
-                    ResidualBlock(channels[-1]*2, channels[-1], t_emb_dim=t_emb_dim))
+                    ResidualBlock(channels[-1], channels[-1], t_emb_dim=t_emb_dim))
             ] + [
                 SwitchSequential(
-                    ResidualBlock(channels[-1]*2, channels[-1], t_emb_dim=t_emb_dim))
+                    ResidualBlock(channels[-1], channels[-1], t_emb_dim=t_emb_dim))
             ] + [
                 SwitchSequential(
                     nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True),
-                    ResidualBlock(channels[i]*2, channels[i-1], t_emb_dim=t_emb_dim),
+                    ResidualBlock(channels[i], channels[i-1], t_emb_dim=t_emb_dim),
                     AttentionBlock(n_attn_head, channels[i-1]//n_attn_head, y_emb_dim=y_emb_dim),
                 ) for i in range(len(channels)-1, 0, -1)
             ])
 
-    def forward(self, x, t_embed, y_embed):
+    def forward(self, x, t, y_embed):
         x = self.in_conv(x)
+        t_embed = self.t_emb_layer(t)
 
         # Encoding
         skip_connections = []
@@ -68,15 +76,17 @@ class UNet(nn.Module):
             skip_connection = skip_connections.pop()
             if skip_connection.size() != x.size():
                 x = F.interpolate(x, size=skip_connection.size()[2:], mode='bilinear', align_corners=False)
-            x = torch.cat((x, skip_connection), dim=1)
+            x = x + skip_connection
             x = layer(x, t_embed, y_embed)
-        return x       
+        x = x / self.marginal_prob_std(t)[:, None, None, None]
+        return x
 
 
 class Diffusion(nn.Module):
-    def __init__(self, config: TrainConfig):
+    def __init__(self, config: TrainConfig, marginal_prob_std):
         super().__init__()
         self.config = config
+        self.marginal_prob_std = marginal_prob_std
         n_classes = config.n_classes
         in_channels = config.in_channels
         channels = config.channels
@@ -84,13 +94,8 @@ class Diffusion(nn.Module):
         t_emb_dim = config.t_emb_dim
         y_emb_dim = config.y_emb_dim
 
-        self.t_emb_layer = nn.Sequential(
-            TimeEmbedding(t_emb_dim),
-            nn.Linear(t_emb_dim, t_emb_dim),
-            nn.GELU()
-        )
         self.y_emb_layer = nn.Embedding(n_classes, y_emb_dim)
-        self.unet = UNet(channels=channels, n_attn_head=n_attn_head, t_emb_dim=t_emb_dim, y_emb_dim=y_emb_dim)
+        self.unet = UNet(marginal_prob_std=self.marginal_prob_std, channels=channels, n_attn_head=n_attn_head, t_emb_dim=t_emb_dim, y_emb_dim=y_emb_dim)
         self.final = nn.Sequential(
             nn.GroupNorm(1, channels[0]),
             nn.GELU(),
@@ -98,9 +103,8 @@ class Diffusion(nn.Module):
         )
     
     def forward(self, x, t, y):
-        t_embed = self.t_emb_layer(t)
         y_embed = self.y_emb_layer(y).unsqueeze(1)
-        output = self.unet(x, t_embed, y_embed)
+        output = self.unet(x, t, y_embed)
         output = self.final(output)
         return output
 
